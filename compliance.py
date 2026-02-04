@@ -23,7 +23,7 @@ MODEL_ID = os.getenv("MODEL_ID")
 from compilance_states import ComplianceViolation, ComplianceReport, ComplianceState, call_gemini_with_retry
 
 # prompt setup
-from prompt import Extract_rules_prompt
+from prompt import Extract_rules_prompt,verify_compilance_system_instruction,verify_compilance_user_prompt
 
 # --- 2. LANGGRAPH NODES ---
 
@@ -117,98 +117,23 @@ def node_verify_compliance(state: ComplianceState):
     user_input = state['user_content']
     mode = state.get('mode', 'unknown')
 
-    system_instruction = f"""
-    You are a Mechanical Compliance Engine. You verify text against a JSON rule set.
-    Your job is to compare 'USER CONTENT' vs 'JSON RULES' and report discrepancies.
-    """
-
-    user_prompt = f"""
-    --- STEP 1: READ THE RULES ---
-    {rules}
-
-    The RULES above are a JSON object with four arrays: data_privacy_pii, citation_style, structure_formatting, phrasing_governance.
-    Treat this JSON as the COMPLETE and ONLY rule source.
-
-    --- STEP 2: READ THE USER CONTENT ---
-    {user_input}
-
-    CRITICAL OVERRIDES:
-    1. IGNORE TRUTH
-       - Do not flag impossible dates or factual errors unless a specific rule in the JSON clearly regulates factual correctness.
-
-    2. IGNORE LOGIC
-       - Do not flag contradictions or inconsistencies unless a specific rule demands internal consistency.
-
-    3. CONTEXTUAL PII
-       - Look in data_privacy_pii rules for explicit masking / redaction / disclosure requirements.
-       - If such a rule exists (e.g., mask names), then any unmasked PII in USER CONTENT that conflicts with that rule is a violation.
-       - If data_privacy_pii contains only "None explicitly stated." or has no masking instruction, then all PII in USER CONTENT is compliant by default.
-
-    MODE BEHAVIOUR:
-    - custom mode: Enforce only what appears as concrete rules in the JSON. If all rule_text fields for a category are "None explicitly stated.", do NOT generate any violations for that category.
-    - standard mode: You may interpret named styles or requirements (e.g., a specified citation style) using general knowledge, but you still must not create new rule topics absent from the JSON.
-
-    CHECKLIST USAGE (ONLY IF MATCHED BY RULES):
-    Use this list ONLY to search for relevant rules in the JSON; do NOT treat it as rules itself:
-    1. Structure: headings and sections.
-    2. Formatting: fonts, spacing, margins, numbering.
-    3. Privacy: PII redaction or disclosure.
-    4. Citations: style and completeness.
-    5. Consistency: acronyms, units, numbering.
-    6. Content Integrity: figures/tables, plagiarism aspects.
-    7. Accessibility: alt text, headings.
-    8. Legal/Ethical: copyright, disclaimers, conflicts.
-    9. Technical Quality: equations, graphics, file format.
-    10. Submission Requirements: page limits, abstracts, forms.
-
-    --- STEP 3: GENERATE REPORT ---
-    Compare USER CONTENT against the JSON RULES. A violation exists only when:
-    - A specific rule_text in the JSON applies; AND
-    - Some span of USER CONTENT conflicts with that rule. and remeber to check the rules of user uploaded to be scanned compulsory
-
-    OUTPUT STRICT JSON SCHEMA:
-    {{
-      "is_compliant": boolean,
-      "overallScore": float(1-100),
-      "detectionConfidence": "LOW", "MEDIUM", or "HIGH",
-      "totalViolations": int,
-      "violations": [
-        {{
-          "rule_category": string,          
-          "rule_reference": string,         
-          "violation_text": string,         
-          "correction_suggestion": string,  
-          "severity": string                
-        }}
-      ],
-      
-    }}
-
-    If there are no violations, return:
-    {{
-      "is_compliant": true,
-      "violations": [],
-      "summary": "The document is fully compliant with the JSON rule set."
-    }}
-    """
-
     try:
         response = call_gemini_with_retry(
             model=MODEL_ID,
-            contents=user_prompt,
+            contents=verify_compilance_user_prompt,
             config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
+                system_instruction=verify_compilance_system_instruction,
                 temperature=0.3,
                 response_mime_type="application/json",
                 response_schema=ComplianceReport
             )
         )
         
-        logger.info(f"[VERIFY] Compliance check completed ({mode} mode)")
+        print(f"[VERIFY] Compliance check completed ({mode} mode)")
         return {"compliance_report": response.text}
 
     except Exception as e:
-        logger.error(f"[VERIFY] Failed: {e}")
+        print(f"[VERIFY] Failed: {e}")
         return {"errors": state.get('errors', []) + [f"Verification failed: {str(e)}"]}
 
 
@@ -219,15 +144,13 @@ def node_cleanup(state: ComplianceState):
     file_to_cleanup = state.get('file_to_cleanup')
     mode = state.get('mode')
     
-    # Only cleanup custom uploads, NEVER admin files
     if file_to_cleanup and mode == "custom":
-        try:
-            client.files.delete(name=file_to_cleanup)
-            logger.info(f"[CLEANUP] Deleted temporary file: {file_to_cleanup}")
-        except Exception as e:
-            logger.warning(f"[CLEANUP] Failed (may already be deleted): {e}")
+        
+        client.files.delete(name=file_to_cleanup)
+            
+        
     else:
-        logger.info(f"[CLEANUP] Skipped - mode: {mode}, no cleanup needed")
+        print(f"[CLEANUP] Skipped - mode: {mode}, no cleanup needed")
     
     return {}
 
@@ -389,100 +312,4 @@ def delete_user_rules(user_id: str, file_id: str) -> Dict[str, Any]:
     return file_store_manager.cleanup_user_file(user_id, file_id)
 
 
-def seed_admin_rules(s3_key: Optional[str] = None) -> Dict[str, Any]:
-    """
-    ADMIN API: Seed the admin store with standard rules.
-    Called once during setup.
-    
-    Args:
-        s3_key: S3 key of admin rules PDF (uses default if not provided)
-        
-    Returns:
-        Seed result
-    """
-    logger.info("[ADMIN] Seeding admin rules...")
-    return file_store_manager.seed_admin_rules(s3_key)
-
-
-# --- HELPER ---
-def _parse_result(final_state: dict) -> Dict[str, Any]:
-    """Parses the final state into a clean result."""
-    if final_state.get("errors"):
-        return {
-            "status": "failed",
-            "errors": final_state["errors"]
-        }
-    
-    if "compliance_report" in final_state:
-        try:
-            report = json.loads(final_state["compliance_report"])
-            return {
-                "status": "success",
-                "report": report
-            }
-        except json.JSONDecodeError:
-            return {
-                "status": "error",
-                "message": "Model returned invalid JSON",
-                "raw_output": final_state["compliance_report"]
-            }
-    
-    return {"status": "unknown_error"}
-
-# =============================================================================
-# STANDALONE DEBUG FUNCTION
-# =============================================================================
-
-def debug_file_search_store(store_name: str, metadata_filter: Optional[str] = None):
-    """
-    Standalone function to test if file search store is working.
-    Call this directly to verify store connectivity.
-    """
-    print("\n" + "="*70)
-    print("[DEBUG] Testing File Search Store Connectivity")
-    print("="*70)
-    
-    print(f"Store: {store_name}")
-    print(f"Filter: {metadata_filter}")
-    
-    # Test 1: List files in store
-    try:
-        files = list(client.file_search_stores.documents.list(parent=store_name))
-        print(f"\n[TEST 1] Files in store: {len(files)}")
-        for f in files[:5]:
-            print(f"  - {f.name}")
-            if hasattr(f, 'custom_metadata') and f.custom_metadata:
-                for m in f.custom_metadata:
-                    print(f"    {m.key}: {m.string_value if hasattr(m, 'string_value') else m.numeric_value}")
-    except Exception as e:
-        print(f"[TEST 1] FAILED: {e}")
-    
-    # Test 2: Simple query to store
-    try:
-        
-        response = client.models.generate_content(
-            model=MODEL_ID,
-            
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                tools=[types.Tool(
-                    file_search=types.FileSearch(
-                        file_search_store_names=[store_name],
-                        metadata_filter=metadata_filter
-                    )
-                )]
-            )
-        )
-        
-        print(f"\n[TEST 2] Simple Query Response:")
-        print(f"  Response: {response.text[:500]}")
-        
-        grounding_info = extract_grounding_info(response)
-        print(f"  File Search Used: {grounding_info['file_search_used']}")
-        print(f"  Sources Found: {grounding_info['sources_found']}")
-        
-    except Exception as e:
-        print(f"[TEST 2] FAILED: {e}")
-    
-    print("\n" + "="*70)
 

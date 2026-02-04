@@ -2,7 +2,6 @@
 Compliance File Store Manager
 
 Manages Google File Search Stores for Compliance service.
-Handles two-store strategy: USER_STORE for custom rules and ADMIN_STORE for standard rules.
 """
 from __future__ import annotations
 
@@ -14,37 +13,23 @@ from typing import Optional, Dict, Any
 
 import requests
 from google import genai
-from google.genai import types
-
-from app.config.settings import settings
-from app.integrations.s3_client import get_s3_client
-
-logger = logging.getLogger(__name__)
+# from google.genai import types
 
 
 class ComplianceFileStoreManager:
     """
     Manages Google File Search Stores for compliance checking.
 
-    Two Store Strategy:
-    1. USER_STORE: Volatile store for user-uploaded custom rules (cleaned up after use)
-    2. ADMIN_STORE: Persistent store for default standard rules (never deleted)
     """
 
     def __init__(self):
         self.client = genai.Client(api_key=settings.GOOGLE_API_KEY)
-        self.s3_client = get_s3_client()
 
         # --- STORE CONFIGURATION ---
         self.USER_STORE_NAME = "Lawvriksh_User_Uploads_v1"
-        self.ADMIN_STORE_NAME = "Lawvriksh_Admin_Standards_v1"
-
-        # S3 location of default admin rules (uploaded by admin once)
-        self.ADMIN_DEFAULT_S3_KEY = settings.ADMIN_DEFAULT_RULES_S3_KEY or "admin/defaults/standard_compliance_rules.pdf"
-
+        
         # Cache store IDs
         self._user_store_id = None
-        self._admin_store_id = None
 
         logger.info(f"Initialized ComplianceFileStoreManager")
 
@@ -159,16 +144,7 @@ class ComplianceFileStoreManager:
             "mode": "custom"
         }
 
-    def get_admin_context(self) -> Dict[str, Any]:
-        """
-        Gets the context for admin standard rules.
-        Called when user checks compliance without uploading custom rules.
-
-        Returns:
-            Context dict for compliance checking with admin rules
-        """
-        return self._setup_admin_context()
-
+   
     def cleanup_user_file(self, user_id: str, file_id: str) -> Dict[str, Any]:
         """
         Deletes a user's uploaded file from the store.
@@ -216,44 +192,7 @@ class ComplianceFileStoreManager:
             logger.error(f"Cleanup failed: {e}")
             return {"status": "error", "message": str(e)}
 
-    def seed_admin_rules(self, s3_key: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Seeds the Admin Store with default rules.
-        Called once by admin to set up the standard rules.
-
-        Args:
-            s3_key: S3 key of admin rules (uses default if not provided)
-
-        Returns:
-            Seed result
-        """
-        try:
-            store_id = self._get_or_create_store(self.ADMIN_STORE_NAME)
-            s3_key = s3_key or self.ADMIN_DEFAULT_S3_KEY
-
-            google_file_name = self._upload_from_s3(
-                store_name=store_id,
-                s3_key=s3_key,
-                metadata=[
-                    {'key': 'type', 'string_value': 'standard_admin_rule'},
-                    {'key': 'version', 'string_value': '2024.1'},
-                    {'key': 'upload_time', 'string_value': str(int(time.time()))}
-                ]
-            )
-
-            logger.info(f"Successfully seeded admin rules: {google_file_name}")
-
-            return {
-                "status": "success",
-                "store_name": store_id,
-                "google_file_name": google_file_name,
-                "message": "Admin rules seeded successfully"
-            }
-
-        except Exception as e:
-            logger.error(f"Admin seed failed: {e}")
-            return {"status": "error", "message": str(e)}
-
+  
     # =========================================================================
     # INTERNAL METHODS
     # =========================================================================
@@ -307,107 +246,7 @@ class ComplianceFileStoreManager:
             "mode": "standard"
         }
 
-    def _ensure_admin_file_exists(self, store_name: str) -> str:
-        """Checks if Admin Rules exist. If not, seeds them from S3."""
-        try:
-            # Find the file by metadata
-            files = list(self.client.file_search_stores.documents.list(
-                parent=store_name
-            ))
-
-            # Check for existing admin rule
-            for f in files:
-                if hasattr(f, 'custom_metadata') and f.custom_metadata:
-                    for m in f.custom_metadata:
-                        if m.key == 'type' and hasattr(m, 'string_value') and m.string_value == 'standard_admin_rule':
-                            logger.info(f"Found existing admin rules in store: {f.name}")
-                            return f.name
-
-            # Not found - seed from S3
-            logger.warning("Admin store empty. Seeding standard rules...")
-            return self._upload_from_s3(
-                store_name=store_name,
-                s3_key=self.ADMIN_DEFAULT_S3_KEY,
-                metadata=[
-                    {'key': 'type', 'string_value': 'standard_admin_rule'},
-                    {'key': 'version', 'string_value': '2024.1'}
-                ]
-            )
-
-        except Exception as e:
-            logger.error(f"Error checking admin store: {e}")
-            raise
-
-    def _upload_from_s3(self, store_name: str, s3_key: str, metadata: list) -> str:
-        """Downloads from S3 and uploads to Google File Store with metadata."""
-        temp_path = None
-
-        try:
-            # Generate presigned URL
-            logger.info(f"Generating presigned URL for S3 key: {s3_key}")
-            download_url = self.s3_client.generate_download_url(key=s3_key, expiration=3600)
-            if not download_url:
-                raise ValueError(f"Failed to generate presigned URL for {s3_key}")
-
-            # Download from S3
-            logger.info(f"Downloading from S3: {s3_key}")
-            response = requests.get(download_url, stream=True, timeout=30)
-
-            # Check if file exists (404 means NoSuchKey)
-            if response.status_code == 404:
-                logger.warning(f"S3 object not found: {s3_key}")
-                raise FileNotFoundError(f"S3 object does not exist: {s3_key}")
-
-            response.raise_for_status()
-
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                for chunk in response.iter_content(chunk_size=8192):
-                    tmp.write(chunk)
-                tmp.flush()
-                temp_path = tmp.name
-
-            # Upload to Gemini Files API
-            logger.info("Uploading to Gemini Files API...")
-            uploaded_file = self.client.files.upload(
-                file=temp_path,
-                config={'mime_type': 'application/pdf'}
-            )
-
-            # Wait for processing
-            while uploaded_file.state.name == "PROCESSING":
-                time.sleep(1)
-                uploaded_file = self.client.files.get(name=uploaded_file.name)
-
-            if uploaded_file.state.name == "FAILED":
-                raise ValueError(f"File upload failed: {uploaded_file.error.message}")
-
-            # Add google_file_name to metadata for cleanup
-            metadata.append({'key': 'google_file_name', 'string_value': uploaded_file.name})
-
-            # Import to store with metadata
-            logger.info(f"Importing to store {store_name} with metadata...")
-            self.client.file_search_stores.import_file(
-                file_search_store_name=store_name,
-                file_name=uploaded_file.name,
-                config={'custom_metadata': metadata}
-            )
-
-            logger.info(f"Successfully imported: {uploaded_file.name}")
-            return uploaded_file.name
-
-        except FileNotFoundError:
-            logger.warning(f"S3 file not found: {s3_key}")
-            raise
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error downloading from S3: {e}")
-            raise Exception(f"Failed to download from S3: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error uploading to Google File Store: {e}")
-            raise
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                os.unlink(temp_path)
-
+ 
     def _get_or_create_store(self, display_name: str) -> str:
         """Gets existing store or creates new one."""
         # Check cache

@@ -8,3 +8,79 @@ Extract_rules_prompt = """
         - If nothing is specified, write: \"None explicitly stated.\"\n\nOUTPUT FORMAT:\n- Provide a clean, human-readable structured list with the four headings above.\n
         - Under each heading, use bullet points.\n- Under any heading with no explicit rules, include exactly one bullet: \"None explicitly stated.\"\n- Base everything ONLY on the text of the Policy Document and create anyhting from own context but whatever is there in document any kind of rules,policies,regulations everything should be retrived ."
     """
+
+
+verify_compilance_system_instruction = f"""
+    You are a Mechanical Compliance Engine. You verify text against a JSON rule set.
+    Your job is to compare 'USER CONTENT' vs 'JSON RULES' and report discrepancies.
+    """
+
+verify_compilance_user_prompt = f"""
+    --- STEP 1: READ THE RULES ---
+    {rules}
+
+    The RULES above are a JSON object with four arrays: data_privacy_pii, citation_style, structure_formatting, phrasing_governance.
+    Treat this JSON as the COMPLETE and ONLY rule source.
+
+    --- STEP 2: READ THE USER CONTENT ---
+    {user_input}
+
+    CRITICAL OVERRIDES:
+    1. IGNORE TRUTH
+       - Do not flag impossible dates or factual errors unless a specific rule in the JSON clearly regulates factual correctness.
+
+    2. IGNORE LOGIC
+       - Do not flag contradictions or inconsistencies unless a specific rule demands internal consistency.
+
+    3. CONTEXTUAL PII
+       - Look in data_privacy_pii rules for explicit masking / redaction / disclosure requirements.
+       - If such a rule exists (e.g., mask names), then any unmasked PII in USER CONTENT that conflicts with that rule is a violation.
+       - If data_privacy_pii contains only "None explicitly stated." or has no masking instruction, then all PII in USER CONTENT is compliant by default.
+
+    MODE BEHAVIOUR:
+    - custom mode: Enforce only what appears as concrete rules in the JSON. If all rule_text fields for a category are "None explicitly stated.", do NOT generate any violations for that category.
+    - standard mode: You may interpret named styles or requirements (e.g., a specified citation style) using general knowledge, but you still must not create new rule topics absent from the JSON.
+
+    CHECKLIST USAGE (ONLY IF MATCHED BY RULES):
+    Use this list ONLY to search for relevant rules in the JSON; do NOT treat it as rules itself:
+    1. Structure: headings and sections.
+    2. Formatting: fonts, spacing, margins, numbering.
+    3. Privacy: PII redaction or disclosure.
+    4. Citations: style and completeness.
+    5. Consistency: acronyms, units, numbering.
+    6. Content Integrity: figures/tables, plagiarism aspects.
+    7. Accessibility: alt text, headings.
+    8. Legal/Ethical: copyright, disclaimers, conflicts.
+    9. Technical Quality: equations, graphics, file format.
+    10. Submission Requirements: page limits, abstracts, forms.
+
+    --- STEP 3: GENERATE REPORT ---
+    Compare USER CONTENT against the JSON RULES. A violation exists only when:
+    - A specific rule_text in the JSON applies; AND
+    - Some span of USER CONTENT conflicts with that rule. and remeber to check the rules of user uploaded to be scanned compulsory
+
+    OUTPUT STRICT JSON SCHEMA:
+    {{
+      "is_compliant": boolean,
+      "overallScore": float(1-100),
+      "detectionConfidence": "LOW", "MEDIUM", or "HIGH",
+      "totalViolations": int,
+      "violations": [
+        {{
+          "rule_category": string,          
+          "rule_reference": string,         
+          "violation_text": string,         
+          "correction_suggestion": string,  
+          "severity": string                
+        }}
+      ],
+      
+    }}
+
+    If there are no violations, return:
+    {{
+      "is_compliant": true,
+      "violations": [],
+      "summary": "The document is fully compliant with the JSON rule set."
+    }}
+    """    
