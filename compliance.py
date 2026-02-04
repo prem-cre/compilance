@@ -2,44 +2,44 @@ import os
 import time
 import json
 
-from typing import TypedDict, Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 from google import genai
 from google.genai import types
 from langgraph.graph import StateGraph, END
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from pydantic import BaseModel
 from dotenv import load_dotenv
+
 load_dotenv()
 
-#intializing this i need to check after integ(toodo)
+# --- IMPORTS ---
+from compliance_file_store import ComplianceFileStoreManager
+from compilance_states import ComplianceViolation, ComplianceReport, ComplianceState, call_gemini_with_retry
+from prompt import Extract_rules_prompt, verify_compliance_system_instruction, get_verify_compliance_prompt
+
+# --- INITIALIZE ---
 file_store_manager = ComplianceFileStoreManager()
-
-
-
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 MODEL_ID = os.getenv("MODEL_ID")
 
-# --- 1. DEFINE STATE & SCHEMA And Retry LOGIC ---
-from compilance_states import ComplianceViolation, ComplianceReport, ComplianceState, call_gemini_with_retry
 
-# prompt setup
-from prompt import Extract_rules_prompt,verify_compilance_system_instruction,verify_compilance_user_prompt
-
-# --- 2. LANGGRAPH NODES ---
+# --- LANGGRAPH NODES ---
 
 def node_setup_context(state: ComplianceState):
     """
-    DECISION NODE: Determines whether to use User rules or Admin rules.
+    DECISION NODE: Sets up context for user's uploaded rules.
+    User must upload their rules PDF - no admin fallback.
     """
     user_id = state.get('user_id')
-    s3_key = state.get('s3_key')  # Can be None
-    file_id = state.get('file_id')
+    file_path = state.get('file_path')  # Local file path
     
     if not user_id:
         return {"errors": state.get('errors', []) + ["Missing user_id"]}
     
+    if not file_path:
+        return {"errors": state.get('errors', []) + ["Missing file_path - user must upload a rules PDF"]}
+    
+    # Check if context already set up
     if state.get("store_name") and state.get("mode") == "custom":
-        logger.info(f"[CONTEXT] Using existing context - Mode: {state['mode']}, Store: {state['store_name']}")
+        print(f"[CONTEXT] Using existing context - Store: {state['store_name']}")
         return {
             "store_name": state["store_name"],
             "metadata_filter": state.get("metadata_filter"),
@@ -48,37 +48,41 @@ def node_setup_context(state: ComplianceState):
         }
 
     try:
-        # THE MAGIC: prepare_compliance_context handles the if/else logic
-        context = file_store_manager.prepare_compliance_context(
+        # Generate file_id from timestamp
+        file_id = f"user_{user_id}_{int(time.time())}"
+        
+        # Upload user's rules document
+        upload_result = file_store_manager.upload_user_document(
+            file_path=file_path,
             user_id=user_id,
-            s3_key=s3_key,
             file_id=file_id
         )
         
-        logger.info(f"[CONTEXT] Mode: {context['mode']}, Store: {context['store_name']}")
+        if upload_result.get("status") != "success":
+            return {"errors": state.get('errors', []) + [upload_result.get("message", "Upload failed")]}
+        
+        print(f"[CONTEXT] Mode: custom, Store: {upload_result['store_name']}")
         
         return {
-            "store_name": context["store_name"],
-            "metadata_filter": context["metadata_filter"],
-            "file_to_cleanup": context.get("file_to_cleanup"),
-            "mode": context["mode"]
+            "store_name": upload_result["store_name"],
+            "metadata_filter": f'user_id = "{user_id}" AND file_id = "{file_id}"',
+            "file_to_cleanup": upload_result.get("google_file_name"),
+            "mode": "custom"
         }
         
     except Exception as e:
-        logger.error(f"[CONTEXT] Setup failed: {e}")
+        print(f"[CONTEXT] Setup failed: {e}")
         return {"errors": state.get('errors', []) + [f"Context setup failed: {str(e)}"]}
 
 
 def node_extract_rules(state: ComplianceState):
     """
-    Extracts compliance rules from the document
+    Extracts compliance rules from the user's uploaded document.
     """
     if not state.get("store_name"):
         return {"extracted_rules": "ERROR: No store configured."}
 
-    mode = state.get('mode', 'unknown')
-    print(f"[EXTRACT] Extracting rules from {mode} document...")
-
+    print(f"[EXTRACT] Extracting rules from user document...")
 
     try:
         # Build file search tool with metadata filter
@@ -98,7 +102,7 @@ def node_extract_rules(state: ComplianceState):
             )
         )
 
-        print(f"[EXTRACT] Successfully extracted rules ({mode} mode)")
+        print(f"[EXTRACT] Successfully extracted rules")
         return {"extracted_rules": response.text}
 
     except Exception as e:
@@ -115,21 +119,23 @@ def node_verify_compliance(state: ComplianceState):
         return {"compliance_report": '{"error": "SKIPPED: Rules could not be extracted."}'}
 
     user_input = state['user_content']
-    mode = state.get('mode', 'unknown')
 
     try:
+        # Get the formatted prompt with rules and user input
+        verify_prompt = get_verify_compliance_prompt(rules, user_input)
+        
         response = call_gemini_with_retry(
             model=MODEL_ID,
-            contents=verify_compilance_user_prompt,
+            contents=verify_prompt,
             config=types.GenerateContentConfig(
-                system_instruction=verify_compilance_system_instruction,
+                system_instruction=verify_compliance_system_instruction,
                 temperature=0.3,
                 response_mime_type="application/json",
                 response_schema=ComplianceReport
             )
         )
         
-        print(f"[VERIFY] Compliance check completed ({mode} mode)")
+        print(f"[VERIFY] Compliance check completed")
         return {"compliance_report": response.text}
 
     except Exception as e:
@@ -139,23 +145,23 @@ def node_verify_compliance(state: ComplianceState):
 
 def node_cleanup(state: ComplianceState):
     """
-    Cleans up user-uploaded files. Does NOT delete admin files.
+    Cleans up user-uploaded files after compliance check.
     """
     file_to_cleanup = state.get('file_to_cleanup')
-    mode = state.get('mode')
     
-    if file_to_cleanup and mode == "custom":
-        
-        client.files.delete(name=file_to_cleanup)
-            
-        
+    if file_to_cleanup:
+        try:
+            client.files.delete(name=file_to_cleanup)
+            print(f"[CLEANUP] Deleted temporary file: {file_to_cleanup}")
+        except Exception as e:
+            print(f"[CLEANUP] Failed to delete file: {e}")
     else:
-        print(f"[CLEANUP] Skipped - mode: {mode}, no cleanup needed")
+        print(f"[CLEANUP] No file to cleanup")
     
     return {}
 
 
-# --- 4. BUILD GRAPH ---
+# --- BUILD GRAPH ---
 workflow = StateGraph(ComplianceState)
 workflow.add_node("setup", node_setup_context)
 workflow.add_node("extract", node_extract_rules)
@@ -175,24 +181,55 @@ compliance_app = workflow.compile()
 # PUBLIC API FUNCTIONS
 # =============================================================================
 
-def upload_user_rules(s3_key: str, user_id: str, file_id: str) -> Dict[str, Any]:
+def upload_user_rules(file_path: str, user_id: str, file_id: str) -> Dict[str, Any]:
     """
     PUBLIC API: Called when user uploads their custom rules PDF.
     Pre-indexes the document for faster compliance checking later.
     
     Args:
-        s3_key: S3 object key of uploaded PDF
+        file_path: Local path to the PDF file
         user_id: User identifier
         file_id: Unique file identifier
         
     Returns:
         Upload result with status
     """
-    logger.info(f"[API] Upload user rules - user: {user_id}, file: {file_id}")
-    return file_store_manager.upload_user_document(s3_key, user_id, file_id)
+    print(f"[API] Upload user rules - user: {user_id}, file: {file_id}")
+    return file_store_manager.upload_user_document(file_path, user_id, file_id)
 
 
-def check_compliance_with_user_rules(
+def check_compliance(
+    user_id: str, 
+    file_path: str, 
+    draft_text: str,
+    cleanup_after: bool = True
+) -> Dict[str, Any]:
+    """
+    PUBLIC API: Check compliance of draft text against user's rules PDF.
+    
+    Args:
+        user_id: User identifier
+        file_path: Local path to the rules PDF
+        draft_text: Text to check for compliance
+        cleanup_after: Whether to delete the uploaded rules after check (default: True)
+        
+    Returns:
+        Compliance report
+    """
+    print(f"[API] Check compliance - user: {user_id}, file: {file_path}")
+    
+    # Run compliance check
+    final_state = compliance_app.invoke({
+        "user_id": user_id,
+        "user_content": draft_text,
+        "file_path": file_path,
+        "errors": []
+    })
+    
+    return _parse_result(final_state)
+
+
+def check_compliance_with_uploaded_rules(
     user_id: str, 
     file_id: str, 
     draft_text: str,
@@ -210,7 +247,7 @@ def check_compliance_with_user_rules(
     Returns:
         Compliance report
     """
-    logger.info(f"[API] Check with USER rules - user: {user_id}, file: {file_id}")
+    print(f"[API] Check with pre-uploaded rules - user: {user_id}, file: {file_id}")
     
     # Get context for the pre-uploaded file
     context = file_store_manager.get_user_context(user_id, file_id)
@@ -219,8 +256,7 @@ def check_compliance_with_user_rules(
     final_state = compliance_app.invoke({
         "user_id": user_id,
         "user_content": draft_text,
-        "s3_key": None,  # Already uploaded
-        "file_id": file_id,
+        "file_path": None,  # Already uploaded
         "store_name": context["store_name"],
         "metadata_filter": context["metadata_filter"],
         "file_to_cleanup": None,  # Don't auto-cleanup
@@ -235,68 +271,6 @@ def check_compliance_with_user_rules(
     return _parse_result(final_state)
 
 
-def check_compliance_with_admin_rules(user_id: str, draft_text: str) -> Dict[str, Any]:
-    """
-    PUBLIC API: Check compliance against default ADMIN standard rules.
-    Used when user doesn't upload custom rules.
-    
-    Args:
-        user_id: User identifier (for logging)
-        draft_text: Text to check for compliance
-        
-    Returns:
-        Compliance report
-    """
-    logger.info(f"[API] Check with ADMIN rules - user: {user_id}")
-    
-    # Run with no s3_key = fallback to admin rules
-    final_state = compliance_app.invoke({
-        "user_id": user_id,
-        "user_content": draft_text,
-        "s3_key": None,
-        "file_id": None,
-        "errors": []
-    })
-    
-    return _parse_result(final_state)
-
-
-def check_compliance_auto(
-    user_id: str, 
-    draft_text: str, 
-    s3_key: Optional[str] = None,
-    file_id: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    PUBLIC API: Smart compliance check that auto-detects which rules to use.
-    
-    - If s3_key provided -> Upload and use user's custom rules
-    - If s3_key is None -> Use admin standard rules
-    
-    Args:
-        user_id: User identifier
-        draft_text: Text to check
-        s3_key: Optional S3 key of custom rules PDF
-        file_id: Optional file identifier
-        
-    Returns:
-        Compliance report with mode indicator
-    """
-    logger.info(f"[API] Auto compliance check - user: {user_id}, has_custom: {bool(s3_key)}")
-    
-    final_state = compliance_app.invoke({
-        "user_id": user_id,
-        "user_content": draft_text,
-        "s3_key": s3_key,
-        "file_id": file_id or f"auto_{int(time.time())}",
-        "errors": []
-    })
-    
-    result = _parse_result(final_state)
-    result["mode"] = final_state.get("mode", "unknown")
-    return result
-
-
 def delete_user_rules(user_id: str, file_id: str) -> Dict[str, Any]:
     """
     PUBLIC API: Delete previously uploaded user rules.
@@ -308,8 +282,31 @@ def delete_user_rules(user_id: str, file_id: str) -> Dict[str, Any]:
     Returns:
         Deletion result
     """
-    logger.info(f"[API] Delete user rules - user: {user_id}, file: {file_id}")
+    print(f"[API] Delete user rules - user: {user_id}, file: {file_id}")
     return file_store_manager.cleanup_user_file(user_id, file_id)
 
 
-
+# --- HELPER ---
+def _parse_result(final_state: dict) -> Dict[str, Any]:
+    """Parses the final state into a clean result."""
+    if final_state.get("errors"):
+        return {
+            "status": "failed",
+            "errors": final_state["errors"]
+        }
+    
+    if "compliance_report" in final_state:
+        try:
+            report = json.loads(final_state["compliance_report"])
+            return {
+                "status": "success",
+                "report": report
+            }
+        except json.JSONDecodeError:
+            return {
+                "status": "error",
+                "message": "Model returned invalid JSON",
+                "raw_output": final_state["compliance_report"]
+            }
+    
+    return {"status": "unknown_error"}
