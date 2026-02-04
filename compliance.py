@@ -119,7 +119,6 @@ def node_verify_compliance(state: ComplianceState):
 
     system_instruction = f"""
     You are a Mechanical Compliance Engine. You verify text against a JSON rule set.
-    
     Your job is to compare 'USER CONTENT' vs 'JSON RULES' and report discrepancies.
     """
 
