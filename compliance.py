@@ -8,67 +8,24 @@ from google.genai import types
 from langgraph.graph import StateGraph, END
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pydantic import BaseModel
+from dotenv import load_dotenv
+load_dotenv()
 
-from app.config.settings import settings
-from app.integrations.compliance_file_store import ComplianceFileStoreManager
-
-# Initialize singleton instance
+#intializing this i need to check after integ(toodo)
 file_store_manager = ComplianceFileStoreManager()
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# --- GEMINI CLIENT ---
-# Note: Using direct genai.Client for now due to LangGraph integration requirements
-# TODO: Consider migrating to app.integrations.gemini_client.GeminiClient for better abstraction
-client = genai.Client(api_key=settings.GOOGLE_API_KEY)
-MODEL_ID = settings.MODEL_ID
 
 
-# --- 1. DEFINE STATE & SCHEMA ---
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+MODEL_ID = os.getenv("MODEL_ID")
 
-class ComplianceViolation(BaseModel):
-    rule_category: str
-    violation_text: str
-    correction_suggestion: str
-    severity: str
+# --- 1. DEFINE STATE & SCHEMA And Retry LOGIC ---
+from compilance_states import ComplianceViolation, ComplianceReport, ComplianceState, call_gemini_with_retry
 
-class ComplianceReport(BaseModel):
-    is_compliant: bool
-    overallScore: float
-    detectionConfidence: str
-    totalViolations: int
-    violations: List[ComplianceViolation]
+# prompt setup
+from prompt import Extract_rules_prompt
 
-class ComplianceState(TypedDict):
-    user_id: str
-    user_content: str
-    s3_key: Optional[str]  # None = use admin rules
-    file_id: Optional[str]
-    store_name: Optional[str]
-    metadata_filter: Optional[str]
-    file_to_cleanup: Optional[str]
-    mode: Optional[str]  # "custom" or "standard"
-    extracted_rules: Optional[str]
-    compliance_report: str
-    errors: List[str]
-
-
-# --- 2. RETRY LOGIC ---
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=2, min=2, max=20),
-    retry=retry_if_exception_type(Exception)
-)
-def call_gemini_with_retry(model, contents, config):
-    return client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=config
-    )
-
-
-# --- 3. LANGGRAPH NODES ---
+# --- 2. LANGGRAPH NODES ---
 
 def node_setup_context(state: ComplianceState):
     """
@@ -114,24 +71,14 @@ def node_setup_context(state: ComplianceState):
 
 def node_extract_rules(state: ComplianceState):
     """
-    Extracts compliance rules from the document (User's or Admin's).
+    Extracts compliance rules from the document
     """
     if not state.get("store_name"):
         return {"extracted_rules": "ERROR: No store configured."}
 
     mode = state.get('mode', 'unknown')
-    logger.info(f"[EXTRACT] Extracting rules from {mode} document...")
+    print(f"[EXTRACT] Extracting rules from {mode} document...")
 
-    prompt = """
-    "You are a Senior Legal Compliance Architect.\nMode: {mode} (\"custom\" or \"standard\").\n\nYou are given an uploaded Policy Document via the file search store.\nYour job is to extract ONLY the rules that are explicitly written in that document.\n\nCRITICAL PRINCIPLES (APPLY IN ALL MODES):\n
-    - Treat the Policy Document as the ONLY source of rules.\n- Do NOT assume or import generic GDPR, privacy, or compliance rules unless the document itself cites them and converts them into concrete instructions.\n- If the document is about Court Filings, remember that names are often REQUIRED; do not hallucinate masking/anonymisation rules unless they are explicitly written.\n
-    - If the document does NOT mention a specific restriction or requirement, you MUST write exactly: \"None explicitly stated.\" for that item.\n\nMode behaviour:\n- custom mode: Be maximally literal and closed-world. Do NOT generalise or broaden rules. Only capture what is plainly written.\n- standard mode: You may lightly rephrase or consolidate rules for clarity, but you still may NOT invent new obligations or prohibitions that are not in the text.\n\nExtract STRICT rules under these headings:\n\n1. Data Privacy / PII\n 
-      - Does the document EXPLICITLY require masking, redacting, pseudonymising, or omitting: names, dates, addresses, phone numbers, email addresses, identification numbers, or other PII?\n   - Does the document EXPLICITLY require FULL disclosure of real names or other identifiers?\n   - For each explicit rule, quote or closely paraphrase the relevant sentence.\n   - If NO explicit rule is given for any of these, output a single line: \"None explicitly stated.\"\n\n2. Citation Style\n   - Note any explicit rule about citation or reference style (e.g., Bluebook, OSCOLA, in-house style, footnotes vs endnotes, etc.).\n   - If there is NO explicit guidance, write: \"None explicitly stated.\"\n\n3. Document Structure & Formatting\n   - List any REQUIRED headings or sections (e.g., \"IN THE HIGH COURT\", \"Abstract\", \"References\", case title formats, etc.).\n 
-      - List any explicit formatting requirements: fonts, sizes, margins, spacing, alignment, paragraph numbering style, page limits, etc.\n   - If an aspect is not mentioned at all, write: \"None explicitly stated.\"\n\n4. Restricted/Required Phrasing (Governance)\n  
-       - List any specific disclaimers, formulas, or standard phrases that MUST appear.\n   - List any words or expressions that are explicitly FORBIDDEN.\n  
-        - If nothing is specified, write: \"None explicitly stated.\"\n\nOUTPUT FORMAT:\n- Provide a clean, human-readable structured list with the four headings above.\n
-        - Under each heading, use bullet points.\n- Under any heading with no explicit rules, include exactly one bullet: \"None explicitly stated.\"\n- Base everything ONLY on the text of the Policy Document and create anyhting from own context but whatever is there in document any kind of rules,policies,regulations everything should be retrived ."
-    """
 
     try:
         # Build file search tool with metadata filter
@@ -144,18 +91,18 @@ def node_extract_rules(state: ComplianceState):
 
         response = call_gemini_with_retry(
             model=MODEL_ID,
-            contents=prompt,
+            contents=Extract_rules_prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 tools=[file_search_tool]
             )
         )
 
-        logger.info(f"[EXTRACT] Successfully extracted rules ({mode} mode)")
+        print(f"[EXTRACT] Successfully extracted rules ({mode} mode)")
         return {"extracted_rules": response.text}
 
     except Exception as e:
-        logger.error(f"[EXTRACT] Failed: {e}")
+        print(f"[EXTRACT] Failed: {e}")
         return {"extracted_rules": f"Error: {str(e)}", "errors": state.get('errors', []) + [str(e)]}
 
 
@@ -172,7 +119,7 @@ def node_verify_compliance(state: ComplianceState):
 
     system_instruction = f"""
     You are a Mechanical Compliance Engine. You verify text against a JSON rule set.
-    Mode: {mode} ("custom" or "standard").
+    
     Your job is to compare 'USER CONTENT' vs 'JSON RULES' and report discrepancies.
     """
 
