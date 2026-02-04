@@ -1,7 +1,8 @@
-app==0.0.1
-langgraph==1.0.7
-protobuf==6.33.5
-pydantic==2.12.5
-python-dotenv==1.2.1
-Requests==2.32.5
-tenacity==9.1.2
+google-genai
+langgraph
+langchain
+langchain-core
+pydantic
+python-dotenv
+tenacity
+streamlit

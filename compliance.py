@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", message="Core Pydantic V1 functionality")
+
 import os
 import time
 import json
@@ -9,6 +12,7 @@ from langgraph.graph import StateGraph, END
 from dotenv import load_dotenv
 
 load_dotenv()
+
 
 # --- IMPORTS ---
 from compliance_file_store import ComplianceFileStoreManager
