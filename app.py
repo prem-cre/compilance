@@ -149,6 +149,7 @@ st.markdown("""
     
     /* Info boxes */
     .info-box {
+        color:black;
         background: #eff6ff;
         border: 1px solid #bfdbfe;
         padding: 1rem;
